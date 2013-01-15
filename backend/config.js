@@ -6,7 +6,7 @@ module.exports = function( ) {
 			service_type: "developer", // developer, drizzle, shower, downpour
 			ttl: 300, // minimum seconds between refreshes
 			location: "/q/zmw:00000.1.06240", // /q/zmw:00000.1.06240 // http://autocomplete.wunderground.com/aq?query=amsterda
-			autoip: true,
+			autoip: false,
 			formula: "Math.round(Math.sqrt(Math.min(({qpf}+0.05) * {pop}, 100)/100) * 255).toString(16)" // qpf = Quantitative Precipitation Forecast (0-Xmm), pop = Probability of Precipitation (0-100)
 		},
 		socket: {
