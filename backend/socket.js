@@ -69,8 +69,8 @@ module.exports = function(app) {
 			}
 
 			if (!match) {
-				console.error("No processor for '" + data + "'");
-				broadcast("err");
+				console.error("No processor for '" + data + "'. Echoing command.");
+				broadcast(data);
 			}
 
 			buffer = buffer.substr(i + 2); // - \r \n
