@@ -1,10 +1,16 @@
 #include <SoftwareSerial.h>
 #include <WiFlyHQ.h>
 #include <ByteBuffer.h>
+#include <Servo.h>
 
 #include "pinout.h"
 #include "config.h"
 #include "network.h"
+
+#define CALIBRATION_NONE 0 // waiting
+#define CALIBRATION_READY 1 // waiting
+#define CALIBRATION_STEP1 2 // moving down
+#define CALIBRATION_STEP2 3 // moving up
 
 WiFly wifly;
 SoftwareSerial wifi(WIFI_RX, WIFI_TX);
@@ -13,6 +19,18 @@ uint32_t connectTime = 0;
 char tmpBuffer[TMP_BUFFER_SIZE + 1];
 ByteBuffer buffer;
 byte rainValues[12];
+Servo servo;
+int activeServo = -1;
+
+byte calibrationServo;
+byte calibrationMode;
+long calibrationStart = 0;
+
+long downDurations[12] = {0};
+long upDurations[12] = {0};
+float positions[12] = {0}; // 0: up, 1: down
+float targetPositions[12] = {0};
+long servoMovementCompleted;
 
 void setup()
 {
@@ -57,89 +75,52 @@ void initWifi()
 			digitalWrite(DEBUG1, HIGH);
 			digitalWrite(DEBUG2, LOW);
 		}
-		digitalWrite(DEBUG1, HIGH);
-		digitalWrite(DEBUG2, HIGH);
-		delay(5000);
-		digitalWrite(DEBUG1, LOW);
-		digitalWrite(DEBUG2, LOW);
-
-		Serial.println(F("Retrying wifi.."));
+		
+		rebootWifly();
 		initWifi();
 		return;
 	}
 
-#ifdef HELLO_SAVANTS
-	Serial.println(F("Setting static ip & gateway"));
-	wifly.disableDHCP();
-	wifly.setIP("10.0.0.235");
-	wifly.setGateway("10.0.0.1");
-#else
-	wifly.enableDHCP();
-#endif
-
-#ifndef HELLO_SAVANTS
 	/* Join wifi network if not already associated */
 	if (!wifly.isAssociated()) {
-#endif
+		delay(1000);
 		/* Setup the WiFly to connect to a wifi network */
 		Serial.print(F("Joining network '"));
 		Serial.print(ssid);
 		Serial.println(F("'"));
 
-		wifly.setSSID(ssid);
-		wifly.setPassphrase(password);
+		wifly.enableDHCP();
 
-		if (wifly.join()) {
+		if (wifly.join(ssid, password, true, WIFLY_MODE_WPA, 50000)) {
 			Serial.println(F("Joined wifi network"));
 		} else {
 			Serial.println(F("Failed to join wifi network"));
 			for (int i = 0; i < 5; i++)
 			{
-				digitalWrite(DEBUG2, HIGH);
+				digitalWrite(DEBUG1, HIGH);
 				digitalWrite(DEBUG2, HIGH);
 				delay(200);
 				digitalWrite(DEBUG1, LOW);
 				digitalWrite(DEBUG2, LOW);
 			}
 
-			Serial.println(F("Rebooting wifly"));
-			wifly.reboot();
-
-			delay(5000);
-
+			rebootWifly();
 			initWifi();
 			return;
 		}
-#ifndef HELLO_SAVANTS
 	} else {
 		Serial.println(F("Already joined network"));
 	}
-#endif
 
 	char buf[32];
 
 	Serial.print("SSID: ");
 	Serial.println(wifly.getSSID(buf, sizeof(buf)));
-	Serial.print("MAC: ");
-	Serial.println(wifly.getMAC(buf, sizeof(buf)));
-	Serial.print("IP: ");
-	Serial.println(wifly.getIP(buf, sizeof(buf)));
-	Serial.print("Netmask: ");
-	Serial.println(wifly.getNetmask(buf, sizeof(buf)));
-	Serial.print("Gateway: ");
-	Serial.println(wifly.getGateway(buf, sizeof(buf)));
 
 	Serial.println(F("Setting wifi device id"));
 	wifly.setDeviceID("Weather Balloon");
 	Serial.println(F("Setting wifi protocol: TCP"));
 	wifly.setIpProtocol(WIFLY_PROTOCOL_TCP);
-
-	Serial.print(F("Pinging "));
-	Serial.print(server);
-	Serial.println(F(".."));
-	boolean ping = wifly.ping(server);
-	Serial.print(F("Ping: "));
-	Serial.println(ping ? "ok!" : "failed");
 
 	Serial.println(F("Wifi initialized"));
 
@@ -147,26 +128,54 @@ void initWifi()
 		Serial.println(F("Closing old connection"));
 		wifly.close();
 	}
+
+	Serial.print(F("Pinging "));
+	Serial.print(server);
+	Serial.println(F(".."));
+	boolean ping = wifly.ping(server);
+	Serial.print(F("Ping: "));
+	Serial.println(ping ? "ok!" : "failed");
+}
+
+void rebootWifly()
+{
+	Serial.println(F("Rebooting wifly"));
+	wifly.reboot();
+
+	digitalWrite(DEBUG1, HIGH);
+	digitalWrite(DEBUG2, HIGH);
+	delay(10000);
+	digitalWrite(DEBUG1, LOW);
+	digitalWrite(DEBUG2, LOW);
 }
 
 void loop()
 {
 	int available;
 
-	if (!wifly.isConnected()) {
+	if (!wifly.isConnected())
+	{
 		Serial.println("Connecting..");
-		if (wifly.open(server, port)) {
+		if (wifly.open(server, port))
+		{
 			Serial.println(F("Connected!"));
 			connectTime = millis();
-		} else {
+		}
+		else
+		{
 			Serial.println("Connection failed. Retrying in 1sec");
 			delay(1000);
 		}
-	} else {
+	}
+	else
+	{
 		available = wifly.available();
-		if (available < 0) {
+		if (available < 0)
+		{
 			Serial.println(F("Disconnected"));
-		} else if (available > 0) {
+		}
+		else if (available > 0)
+		{
 			bool readSuccess = wifly.gets(tmpBuffer, TMP_BUFFER_SIZE);
 
 			if (readSuccess) {
@@ -177,25 +186,103 @@ void loop()
 			}
 		}
 
-		/* Send data from the serial monitor to the TCP server */
-		if (Serial.available()) {
+		if (Serial.available())
+		{
 			wifly.write(Serial.read());
 		}
+	}
+
+	// If not calibrating and servo is not moving, check if servos should be moved
+	if (calibrationMode == CALIBRATION_NONE)
+	{
+		if (activeServo < 0)
+		{
+			// Check if servos should be moved
+			for (int i = 0; i < 12; i++)
+			{
+				if (targetPositions[i] != positions[i])
+				{
+					Serial.print(F("Moving servo "));
+					Serial.println(i);
+					int multiplier = 0;
+					if (targetPositions[i] < positions[i])
+					{
+						// Move up
+						setServo(i, 90 - SPEED);
+						multiplier = upDurations[i];
+					}
+					else
+					{
+						setServo(i, 90 + SPEED);
+						multiplier = downDurations[i];
+					}
+					int movementDuration = abs(targetPositions[i] - positions[i]) * multiplier * 0.928571429f;
+					servoMovementCompleted = millis() + movementDuration;
+				}
+			}
+		}
+		else
+		{
+			// Servo is moving
+			if (millis() >= servoMovementCompleted)
+			{
+				int _activeServo = activeServo;
+				positions[activeServo] = targetPositions[activeServo];
+				setServo(activeServo, 90);
+				Serial.print(F("Servo "));
+				Serial.print(_activeServo);
+				Serial.println(F(" completed."));
+			}
+		}
+	}
+	else
+	{
+		digitalWrite(DEBUG1, !digitalRead(DEBUG1));
+		delay(50);
+	}
+}
+
+// 0-180, 90 = stop
+void setServo(byte index, byte angle)
+{
+	if (activeServo > 0)
+	{
+		servo.write(90);
+		delay(10);
+	}
+	servo.detach();
+
+	if (activeServo >= 0) pinMode(activeServo, INPUT);
+
+	if (angle != 90)
+	{
+		servo.attach(2 + index); // starts from pin 2
+		servo.write(angle);
+		activeServo = index;
+	}
+	else
+	{
+		activeServo = -1;
 	}
 }
 
 void processBuffer()
 {
 	char c = buffer.get();
+
+	byte index;
+	byte angle;
+	int servoIndex = 0;
+
 	switch (c)
 	{
 		case 'u': // example: u:24|24|7e|1f|1f|7e|1f|1f|3e|1a|1a|12 - values in base 16, 0 - 255
 			buffer.get(); // skip :
 			while ((c = buffer.get()) != 0)
 			{
-				int servoIndex = 0;
 				if (c == '|') // values separated by |
 				{
+					Serial.println(F("Increase servo index.."));
 					servoIndex++;
 				}
 				else
@@ -210,20 +297,111 @@ void processBuffer()
 					if (*end) val = 0;
 					rainValues[servoIndex] = val;
 
+					Serial.print(servoIndex);
+					Serial.print(F(": "));
 					Serial.println(rainValues[servoIndex]);
 				}
 			}
 			updateServos();
 			break;
-		default:
+		case 'c': // example: c00 - c0c (c index 0-c, e.g., c36 stops servo 3)
+			if (calibrationMode == CALIBRATION_NONE)
+			{
+				// Start calibration
+				calibrationServo = buffer.get() - '0';
+				calibrationMode = CALIBRATION_READY;
+				Serial.print(F("Ready to calibrate "));
+				Serial.println(calibrationServo);
+			}
+			else
+			{
+				Serial.println(F("Already in calibration mode"));
+			}
+			break;
+		case 't': // top
+			if (calibrationMode == CALIBRATION_READY)
+			{
+				setServo(calibrationServo, 90 - SPEED);
+			} else Serial.println(F("Not in calibration mode"));
+			break;
+		case 'b': // bottom
+			if (calibrationMode == CALIBRATION_READY)
+			{
+				setServo(calibrationServo, 90 + SPEED);
+			} else Serial.println(F("Not in calibration mode"));
+			break;
+		case 'f': // freeze
+			if (calibrationMode == CALIBRATION_READY)
+			{
+				setServo(calibrationServo, 90);
+			} else Serial.println(F("Not in calibration mode"));
+			break;
+		case 's':
+			switch (calibrationMode)
+			{
+				case CALIBRATION_READY:
+					// start moving down at full speed
+					delay(1000);
+					setServo(calibrationServo, 90 + SPEED);
+					break;
+				case CALIBRATION_STEP1:
+					// should be all the way down now
+					downDurations[calibrationServo] = millis() - calibrationStart;
 
+					setServo(calibrationServo, 90);
+					delay(1000);
+					setServo(calibrationServo, 90 - SPEED);
+					break;
+				case CALIBRATION_STEP2:
+					// should be all the way up now
+					upDurations[calibrationServo] = millis() - calibrationStart;
+					setServo(calibrationServo, 90);
+
+					Serial.print(F("Calibration for servo "));
+					Serial.print(calibrationServo);
+					Serial.print(" completed. Down: ");
+					Serial.print(downDurations[calibrationServo]);
+					Serial.print(", up: ");
+					Serial.println(upDurations[calibrationServo]);
+					break;
+				default:
+					return;
+					break;
+			}
+			calibrationStart = millis();
+
+			// proceed
+			if (++calibrationMode > CALIBRATION_STEP2)
+			{
+				calibrationMode = CALIBRATION_NONE; // done!
+				calibrationServo = 0;
+			}
+			break;
+		default:
+			Serial.print("Ignoring ");
+			Serial.println(c);
 			break;
 	}	
 }
 
 void updateServos()
 {
-
+	for (int i = 0; i < 12; i++)
+	{
+		if (upDurations[i] > 0 && downDurations[i] > 0)
+		{
+			targetPositions[i] = (float)rainValues[i] / 255.0f;
+			Serial.print(rainValues[i]);
+			Serial.print(F(" / 255.0f = "));
+			Serial.println((float)rainValues[i] / 255.0f);
+		}
+	}
+	Serial.println(F("Target positions updated: "));
+	for (int i = 0; i < 12; i++)
+	{
+		Serial.print("  ");
+		Serial.println(targetPositions[i], DEC);
+	}
 }
 
 void enterTerminalMode()
