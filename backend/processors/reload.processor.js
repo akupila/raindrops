@@ -57,7 +57,7 @@ module.exports = function(app) {
 			formula = formula.replace("{pop}", pop);
 			var result = eval(formula);
 			console.log(hour.FCTTIME.hour + ":" + hour.FCTTIME.min + ": " + formula + " = " + result);
-			results.push(result);
+			results.push(result >= 10 ? result : "0" + result);
 		}
 		while (results.length < 12) results.push(0);
 
