@@ -55,7 +55,7 @@ module.exports = function(app) {
 		var i = buffer.indexOf("\r\n");
 		if (i >= 0) {
 			// Strip invalid/corrupt data
-			var data = buffer.substring(0, i).replace(/([^\w\d:,\-\|])/g, "");
+			var data = buffer.substring(0, i).replace(/([^\w\d:,\-\|<>])/g, "");
 
 			console.log(new Date().toString() + " : Incoming: " + data);
 
