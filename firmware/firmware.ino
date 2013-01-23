@@ -1,16 +1,20 @@
 #include <SoftwareSerial.h>
 #include <WiFlyHQ.h>
 #include <ByteBuffer.h>
-#include <Servo.h>
+#include <ContinuousServo.h>
+#include <EEPROM.h>
+#include <Wire.h>
 
 #include "pinout.h"
 #include "config.h"
 #include "network.h"
 
-#define CALIBRATION_NONE 0 // waiting
-#define CALIBRATION_READY 1 // waiting
-#define CALIBRATION_STEP1 2 // moving down
-#define CALIBRATION_STEP2 3 // moving up
+#define CALIBRATION_NONE		0 // not in calibration mode
+#define CALIBRATION_READY		1 // waiting
+#define CALIBRATION_STEP1		2 // moving down
+#define CALIBRATION_RESETTING	3 // moving down
+
+#define NUDGE_SIZE				1 // steps
 
 WiFly wifly;
 SoftwareSerial wifi(WIFI_RX, WIFI_TX);
@@ -19,33 +23,52 @@ uint32_t connectTime = 0;
 char tmpBuffer[TMP_BUFFER_SIZE + 1];
 ByteBuffer buffer;
 byte rainValues[12];
-Servo servo;
-int activeServo = -1;
 
 byte calibrationServo;
 byte calibrationMode;
-long calibrationStart = 0;
 
-long downDurations[12] = {0};
-long upDurations[12] = {0};
-float positions[12] = {0}; // 0: up, 1: down
-float targetPositions[12] = {0};
-long servoMovementCompleted;
+int pulseWidths[24] = {
+	564, 1793,
+	564, 1793,
+	564, 1793,
+	564, 1793,
+	564, 1793,
+	564, 1793,
+	564, 1793,
+	564, 1793,
+	564, 1793,
+	564, 1793,
+	564, 1793,
+	564, 1793
+};
+ContinuousServo *servos[12]; // Array of pointers to ContinuousServo objects
+int totalSteps[12];
+int targetSteps[12];
+int rotations[12];
+int currentServoIndex;
 
 void setup()
 {
+	Serial.begin(57600);
+	Serial.print(F("Initializing I2C on address "));
+	Serial.println(I2C_ADDRESS);
+
+	// Be ready for I2C initial state data
+	Wire.begin(I2C_ADDRESS);
+	Wire.onReceive(i2cHandler);
+
 	// Configure pins
 	pinMode(DEBUG1, OUTPUT);
 	pinMode(DEBUG2, OUTPUT);
 	pinMode(WIFI_RX, INPUT);
 	pinMode(WIFI_TX, OUTPUT);
 
-	for (unsigned int servo = 0; servo < 12; servo++)
+	for (unsigned int i = 0; i < 12; i++)
 	{
-		pinMode(servo, INPUT);
+		pinMode(i, INPUT);
+		servos[i] = new ContinuousServo(i + 2, pulseWidths[i * 2], pulseWidths[i * 2 + 1]);
 	}
 
-	Serial.begin(57600);
 	buffer.init(BUFFER_SIZE);
 
 	digitalWrite(DEBUG1, HIGH);
@@ -53,6 +76,15 @@ void setup()
 	delay(100);
 	digitalWrite(DEBUG1, LOW);
 	digitalWrite(DEBUG2, LOW);
+
+	Serial.println(F("Reading EEPROM"));
+	for (unsigned int i = 0; i < 12; i++)
+	{
+		ContinuousServo *servo = servos[i];
+		totalSteps[i]	= readIntFromEEPROM(i * 6 + 0);
+		servo->storeSteps(readIntFromEEPROM(i * 6 + 2));
+	}
+	outputDebugInfo();
 
 	Serial.println(F("Ready"));
 
@@ -62,7 +94,7 @@ void setup()
 void initWifi()
 {
 	Serial.println(F("Initializing wifi"));
-	wifi.begin(9600);
+	wifi.begin(9600); // todo: try faster baud rate?
 
 	if (!wifly.begin(&wifi, &Serial))
 	{
@@ -135,6 +167,15 @@ void initWifi()
 	boolean ping = wifly.ping(server);
 	Serial.print(F("Ping: "));
 	Serial.println(ping ? "ok!" : "failed");
+	if (!ping)
+	{
+		Serial.println(F("Pinging google.."));
+		ping = wifly.ping("google.com");
+		Serial.print(F("Ping: "));
+		Serial.println(ping ? "ok!" : "failed");
+	}
+
+	delay(1000);
 }
 
 void rebootWifly()
@@ -176,93 +217,17 @@ void loop()
 		}
 		else if (available > 0)
 		{
+			ContinuousServo *firstServo = servos[0];
+
 			bool readSuccess = wifly.gets(tmpBuffer, TMP_BUFFER_SIZE);
 
 			if (readSuccess) {
-				Serial.println(F("Got some data.."));
+				Serial.print(F("Got some data: "));
 				Serial.println(tmpBuffer);
 				buffer.putCharArray(tmpBuffer);
 				processBuffer();
 			}
 		}
-
-		if (Serial.available())
-		{
-			wifly.write(Serial.read());
-		}
-	}
-
-	// If not calibrating and servo is not moving, check if servos should be moved
-	if (calibrationMode == CALIBRATION_NONE)
-	{
-		if (activeServo < 0)
-		{
-			// Check if servos should be moved
-			for (int i = 0; i < 12; i++)
-			{
-				if (targetPositions[i] != positions[i])
-				{
-					Serial.print(F("Moving servo "));
-					Serial.println(i);
-					int multiplier = 0;
-					if (targetPositions[i] < positions[i])
-					{
-						// Move up
-						setServo(i, 90 - SPEED);
-						multiplier = upDurations[i];
-					}
-					else
-					{
-						setServo(i, 90 + SPEED);
-						multiplier = downDurations[i];
-					}
-					int movementDuration = abs(targetPositions[i] - positions[i]) * multiplier * 0.928571429f;
-					servoMovementCompleted = millis() + movementDuration;
-				}
-			}
-		}
-		else
-		{
-			// Servo is moving
-			if (millis() >= servoMovementCompleted)
-			{
-				int _activeServo = activeServo;
-				positions[activeServo] = targetPositions[activeServo];
-				setServo(activeServo, 90);
-				Serial.print(F("Servo "));
-				Serial.print(_activeServo);
-				Serial.println(F(" completed."));
-			}
-		}
-	}
-	else
-	{
-		digitalWrite(DEBUG1, !digitalRead(DEBUG1));
-		delay(50);
-	}
-}
-
-// 0-180, 90 = stop
-void setServo(byte index, byte angle)
-{
-	if (activeServo > 0)
-	{
-		servo.write(90);
-		delay(10);
-	}
-	servo.detach();
-
-	if (activeServo >= 0) pinMode(activeServo, INPUT);
-
-	if (angle != 90)
-	{
-		servo.attach(2 + index); // starts from pin 2
-		servo.write(angle);
-		activeServo = index;
-	}
-	else
-	{
-		activeServo = -1;
 	}
 }
 
@@ -274,6 +239,8 @@ void processBuffer()
 	byte angle;
 	int servoIndex = 0;
 
+	ContinuousServo *servo = servos[calibrationServo];
+
 	switch (c)
 	{
 		case 'u': // example: u:24|24|7e|1f|1f|7e|1f|1f|3e|1a|1a|12 - values in base 16, 0 - 255
@@ -282,7 +249,6 @@ void processBuffer()
 			{
 				if (c == '|') // values separated by |
 				{
-					Serial.println(F("Increase servo index.."));
 					servoIndex++;
 				}
 				else
@@ -296,15 +262,11 @@ void processBuffer()
 					byte val = strtol(valArr, &end, 16);
 					if (*end) val = 0;
 					rainValues[servoIndex] = val;
-
-					Serial.print(servoIndex);
-					Serial.print(F(": "));
-					Serial.println(rainValues[servoIndex]);
 				}
 			}
 			updateServos();
 			break;
-		case 'c': // example: c00 - c0c (c index 0-c, e.g., c36 stops servo 3)
+		case 'c':
 			if (calibrationMode == CALIBRATION_NONE)
 			{
 				// Start calibration
@@ -312,70 +274,79 @@ void processBuffer()
 				calibrationMode = CALIBRATION_READY;
 				Serial.print(F("Ready to calibrate "));
 				Serial.println(calibrationServo);
+				Serial.println(F("'d' to move down and define bottom"));
 			}
 			else
 			{
 				Serial.println(F("Already in calibration mode"));
 			}
 			break;
-		case 't': // top
-			if (calibrationMode == CALIBRATION_READY)
-			{
-				setServo(calibrationServo, 90 - SPEED);
-			} else Serial.println(F("Not in calibration mode"));
-			break;
-		case 'b': // bottom
-			if (calibrationMode == CALIBRATION_READY)
-			{
-				setServo(calibrationServo, 90 + SPEED);
-			} else Serial.println(F("Not in calibration mode"));
-			break;
 		case 'f': // freeze
+			if (calibrationMode == CALIBRATION_READY || calibrationMode == CALIBRATION_STEP1)
+			{
+				servo->stop();
+			} else Serial.println(F("Not in calibration mode"));
+			break;
+		case '<': // nudge up
+			if (calibrationMode == CALIBRATION_READY || calibrationMode == CALIBRATION_STEP1)
+			{
+				Serial.print(F("Nudging "));
+				Serial.println(-NUDGE_SIZE);
+				servo->step(-NUDGE_SIZE);
+			} else Serial.println(F("Not in calibration mode"));
+			break;
+		case '>': // nudge down
+			if (calibrationMode == CALIBRATION_READY || calibrationMode == CALIBRATION_STEP1)
+			{
+				Serial.print(F("Nudging "));
+				Serial.println(NUDGE_SIZE);
+				servo->step(NUDGE_SIZE);
+			} else Serial.println(F("Not in calibration mode"));
+			break;
+		case 'd': // bottom
 			if (calibrationMode == CALIBRATION_READY)
 			{
-				setServo(calibrationServo, 90);
+				Serial.println(F("Moving down. 'f' to freeze, '< and '>' to nudge up/down"));
+				servo->step(10000); // Start moving down
 			} else Serial.println(F("Not in calibration mode"));
 			break;
 		case 's':
 			switch (calibrationMode)
 			{
 				case CALIBRATION_READY:
-					// start moving down at full speed
+					// start moving up at full speed
+					Serial.println(F("Finding top position.."));
 					delay(1000);
-					setServo(calibrationServo, 90 + SPEED);
+					servo->storeSteps(0);
+					servo->step(-25000);
 					break;
 				case CALIBRATION_STEP1:
-					// should be all the way down now
-					downDurations[calibrationServo] = millis() - calibrationStart;
-
-					setServo(calibrationServo, 90);
-					delay(1000);
-					setServo(calibrationServo, 90 - SPEED);
-					break;
-				case CALIBRATION_STEP2:
 					// should be all the way up now
-					upDurations[calibrationServo] = millis() - calibrationStart;
-					setServo(calibrationServo, 90);
+					servo->stop();
+					totalSteps[calibrationServo] = abs(servo->getSteps());
 
-					Serial.print(F("Calibration for servo "));
-					Serial.print(calibrationServo);
-					Serial.print(" completed. Down: ");
-					Serial.print(downDurations[calibrationServo]);
-					Serial.print(", up: ");
-					Serial.println(upDurations[calibrationServo]);
+					Serial.print(F("Total: "));
+					Serial.print(totalSteps[calibrationServo]);
+					Serial.println(F(" steps."));
+
+					Serial.println(F("Resetting to bottom.."));
+
+					servo->stepTo(0, calibrationFinished);
+					calibrationMode = CALIBRATION_RESETTING;
 					break;
 				default:
 					return;
 					break;
 			}
-			calibrationStart = millis();
 
 			// proceed
-			if (++calibrationMode > CALIBRATION_STEP2)
+			if (calibrationMode != CALIBRATION_RESETTING)
 			{
-				calibrationMode = CALIBRATION_NONE; // done!
-				calibrationServo = 0;
+				calibrationMode++;
 			}
+			break;
+		case 'o':
+			outputDebugInfo();
 			break;
 		default:
 			Serial.print("Ignoring ");
@@ -384,37 +355,118 @@ void processBuffer()
 	}	
 }
 
+// void i2cHandler(int howMany)
+// {
+//   Serial.println(howMany);
+//   char c = Wire.read();
+//   Serial.print(c);
+//   Serial.print(F(" "));
+//   byte a = Wire.read() - '0';
+//   Serial.print(a);
+//   Serial.println(Wire.read());
+// }
+
+void i2cHandler(int dataSize)
+{
+	char command = Wire.read();
+
+	switch (command)
+	{
+		case 'i': // initial
+			// Format: i110100101100 - i -> on full rotation
+			break;
+		case 'u': // update
+			byte index = Wire.read() - '0'; // address is a char, 0-255
+			bool active = Wire.read();
+
+			Serial.print(index);
+			Serial.print(F(" -> "));
+			Serial.println(active);
+			break;
+	}
+}
+
+void calibrationFinished()
+{
+	Serial.print(F("Calibration for "));
+	Serial.print(calibrationServo);
+	Serial.println(F(" completed. Saving to EEPROM."));
+
+	writeIntToEEPROM(calibrationServo * 4, totalSteps[calibrationServo]);
+	writeIntToEEPROM(calibrationServo * 4 + 2, 0);
+
+	calibrationMode = CALIBRATION_NONE;
+	calibrationServo = -1;
+}
+
+void outputDebugInfo()
+{
+	Serial.println(F("Timing values (up / down):"));
+	for (int i = 0; i < 12; i++)
+	{
+		ContinuousServo *servo = servos[i];
+		Serial.print(F("  "));
+		Serial.print(i);
+		Serial.print(F(": "));
+		Serial.print(totalSteps[i]);
+		Serial.print(F(" @ "));
+		Serial.println(servo->getSteps());
+	}
+}
+
+void writeIntToEEPROM(unsigned int address, int value)
+{
+	byte lowByte = ((value >> 0) & 0xFF);
+	byte highByte = ((value >> 8) & 0xFF);
+
+	EEPROM.write(address, lowByte);
+	EEPROM.write(address + 1, highByte);
+}
+
+int readIntFromEEPROM(unsigned int address)
+{
+	byte lowByte = EEPROM.read(address);
+	byte highByte = EEPROM.read(address + 1);
+
+	return ((lowByte << 0) & 0xFF) + ((highByte << 8) & 0xFF00);
+}
+
 void updateServos()
 {
 	for (int i = 0; i < 12; i++)
 	{
-		if (upDurations[i] > 0 && downDurations[i] > 0)
+		if (totalSteps[i] > 0)
 		{
-			targetPositions[i] = (float)rainValues[i] / 255.0f;
+			targetSteps[i] = (float)rainValues[i] / 255.0f * totalSteps[i];
 			Serial.print(rainValues[i]);
 			Serial.print(F(" / 255.0f = "));
-			Serial.println((float)rainValues[i] / 255.0f);
+			Serial.print((float)rainValues[i] / 255.0f);
+			Serial.print(F(", "));
+			Serial.print(targetSteps[i]);
+			Serial.println(F(" steps"));
 		}
 	}
-	Serial.println(F("Target positions updated: "));
-	for (int i = 0; i < 12; i++)
-	{
-		Serial.print("  ");
-		Serial.println(targetPositions[i], DEC);
-	}
+
+	currentServoIndex = -1;
+	updateNextServo();
 }
 
-void enterTerminalMode()
+void updateNextServo()
 {
-	Serial.println(F("Entered terminal mode. Reboot to exit."));
-    while (1) {
-		if (wifly.available() > 0) {
-			Serial.write(wifly.read());
-		}
-
-
-		if (Serial.available() > 0) {
-			wifly.write(Serial.read());
-		}
-    }
+	if (currentServoIndex >= 0)
+	{
+		// Previous servo completed
+		ContinuousServo *servo = servos[currentServoIndex];
+		writeIntToEEPROM(currentServoIndex * 4 + 2, servo->getSteps());
+	}
+	if (++currentServoIndex >= 12) return;
+	ContinuousServo *servo = servos[currentServoIndex];
+	if (targetSteps[currentServoIndex] != servo->getSteps())
+	{
+		servo->stepTo(targetSteps[currentServoIndex], updateNextServo);
+	}
+	else
+	{
+		updateNextServo();
+	}
 }
