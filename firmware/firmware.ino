@@ -11,7 +11,7 @@
 
 #define CALIBRATION_NONE		0 // not in calibration mode
 #define CALIBRATION_READY		1 // waiting
-#define CALIBRATION_STEP1		2 // moving down
+#define CALIBRATION_FINDING_TOP		2 // moving down
 #define CALIBRATION_RESETTING	3 // moving down
 
 #define NUDGE_SIZE				1 // steps
@@ -24,7 +24,7 @@ char tmpBuffer[TMP_BUFFER_SIZE + 1];
 ByteBuffer buffer;
 byte rainValues[12];
 
-byte calibrationServo;
+volatile byte calibrationServo;
 byte calibrationMode;
 
 int pulseWidths[24] = {
@@ -42,9 +42,13 @@ int pulseWidths[24] = {
 	564, 1793
 };
 ContinuousServo *servos[12]; // Array of pointers to ContinuousServo objects
+int totalRotations[12]; // + steps
 int totalSteps[12];
+
+int currentRotations[12]; // current steps in servo
+int targetRotations[12]; // + steps
 int targetSteps[12];
-int rotations[12];
+
 int currentServoIndex;
 
 void setup()
@@ -80,9 +84,13 @@ void setup()
 	Serial.println(F("Reading EEPROM"));
 	for (unsigned int i = 0; i < 12; i++)
 	{
+		// format (all ints)
+		// [rotations][steps][current rotations][current steps]
 		ContinuousServo *servo = servos[i];
-		totalSteps[i]	= readIntFromEEPROM(i * 6 + 0);
-		servo->storeSteps(readIntFromEEPROM(i * 6 + 2));
+		totalRotations[i]	= 	readIntFromEEPROM(i * 8 + 0);
+		totalSteps[i]		= 	readIntFromEEPROM(i * 8 + 2);
+		currentRotations[i]	= 	readIntFromEEPROM(i * 8 + 4);
+		servo->storeSteps(		readIntFromEEPROM(i * 8 + 6));
 	}
 	outputDebugInfo();
 
@@ -282,13 +290,13 @@ void processBuffer()
 			}
 			break;
 		case 'f': // freeze
-			if (calibrationMode == CALIBRATION_READY || calibrationMode == CALIBRATION_STEP1)
+			if (calibrationMode == CALIBRATION_READY || calibrationMode == CALIBRATION_FINDING_TOP)
 			{
 				servo->stop();
 			} else Serial.println(F("Not in calibration mode"));
 			break;
 		case '<': // nudge up
-			if (calibrationMode == CALIBRATION_READY || calibrationMode == CALIBRATION_STEP1)
+			if (calibrationMode == CALIBRATION_READY || calibrationMode == CALIBRATION_FINDING_TOP)
 			{
 				Serial.print(F("Nudging "));
 				Serial.println(-NUDGE_SIZE);
@@ -296,7 +304,7 @@ void processBuffer()
 			} else Serial.println(F("Not in calibration mode"));
 			break;
 		case '>': // nudge down
-			if (calibrationMode == CALIBRATION_READY || calibrationMode == CALIBRATION_STEP1)
+			if (calibrationMode == CALIBRATION_READY || calibrationMode == CALIBRATION_FINDING_TOP)
 			{
 				Serial.print(F("Nudging "));
 				Serial.println(NUDGE_SIZE);
@@ -307,31 +315,51 @@ void processBuffer()
 			if (calibrationMode == CALIBRATION_READY)
 			{
 				Serial.println(F("Moving down. 'f' to freeze, '< and '>' to nudge up/down"));
-				servo->step(10000); // Start moving down
+				servo->step(-10000); // Start moving down
 			} else Serial.println(F("Not in calibration mode"));
 			break;
 		case 's':
+			int invertedSteps;
 			switch (calibrationMode)
 			{
 				case CALIBRATION_READY:
 					// start moving up at full speed
+					totalRotations[calibrationServo] = 0;
+					currentRotations[calibrationServo] = 0;
 					Serial.println(F("Finding top position.."));
 					delay(1000);
 					servo->storeSteps(0);
-					servo->step(-25000);
+					servo->step(10000);
 					break;
-				case CALIBRATION_STEP1:
+				case CALIBRATION_FINDING_TOP:
 					// should be all the way up now
 					servo->stop();
-					totalSteps[calibrationServo] = abs(servo->getSteps());
+					totalSteps[calibrationServo] = servo->getSteps();
+					currentRotations[index] = totalRotations[index];
 
 					Serial.print(F("Total: "));
+					Serial.print(totalRotations[calibrationServo]);
+					Serial.print(F(" rotations, "));
 					Serial.print(totalSteps[calibrationServo]);
 					Serial.println(F(" steps."));
 
-					Serial.println(F("Resetting to bottom.."));
+					targetRotations[currentServoIndex] = 0;
 
-					servo->stepTo(0, calibrationFinished);
+					invertedSteps = -totalSteps[currentServoIndex];
+
+					targetSteps[currentServoIndex] = invertedSteps;
+
+					Serial.println(F("Resetting to bottom.."));
+					Serial.print(totalRotations[calibrationServo]);
+					Serial.print(F(" + "));
+					Serial.print(totalSteps[calibrationServo]);
+					Serial.print(F(" -> "));
+					Serial.print(targetRotations[calibrationServo]);
+					Serial.print(F(" + "));
+					Serial.println(invertedSteps);
+
+					servo->step(-10000);
+
 					calibrationMode = CALIBRATION_RESETTING;
 					break;
 				default:
@@ -355,17 +383,6 @@ void processBuffer()
 	}	
 }
 
-// void i2cHandler(int howMany)
-// {
-//   Serial.println(howMany);
-//   char c = Wire.read();
-//   Serial.print(c);
-//   Serial.print(F(" "));
-//   byte a = Wire.read() - '0';
-//   Serial.print(a);
-//   Serial.println(Wire.read());
-// }
-
 void i2cHandler(int dataSize)
 {
 	char command = Wire.read();
@@ -374,42 +391,99 @@ void i2cHandler(int dataSize)
 	{
 		case 'i': // initial
 			// Format: i110100101100 - i -> on full rotation
+			Serial.println(F("Got init I2C info from sensor"));
 			break;
 		case 'u': // update
 			byte index = Wire.read() - '0'; // address is a char, 0-255
 			bool active = Wire.read();
 
-			Serial.print(index);
-			Serial.print(F(" -> "));
-			Serial.println(active);
+			if (active)
+			{
+				ContinuousServo *servo = servos[index];
+				servo->storeSteps(0); // relative to 0
+
+				currentRotations[index] += servo->getDirection();
+
+				if (calibrationMode == CALIBRATION_FINDING_TOP)
+				{
+					totalRotations[index]++; // always positive
+					Serial.print(index);
+					Serial.print(F(" : "));
+					Serial.println(totalRotations[index]);
+				}
+				else
+				{
+					Serial.print(currentRotations[index]);
+					Serial.print(F(" / "));
+					Serial.println(targetRotations[index]);
+
+					if (currentRotations[index] == targetRotations[index])
+					{
+						servo->stop();
+						// Serial.println(F("Reached target rotation. Adjusting final steps.."));
+						void (*callback)() = (calibrationMode == CALIBRATION_RESETTING ? calibrationFinished : updateNextServo);
+
+						if (targetSteps[index] != 0)
+						{
+							servo->step(targetSteps[index], callback);
+						}
+						else
+						{
+							callback();
+						}
+					}
+				}
+			}
+			else
+			{
+				// Serial.print(index);
+				// Serial.println(F(" no longer centered"));
+			}
+
 			break;
 	}
 }
 
 void calibrationFinished()
 {
-	Serial.print(F("Calibration for "));
-	Serial.print(calibrationServo);
-	Serial.println(F(" completed. Saving to EEPROM."));
+	digitalWrite(DEBUG1, HIGH);
+	digitalWrite(DEBUG2, HIGH);
+	// Serial.print(F("Calibration for "));
+	// Serial.print(calibrationServo);
+	// Serial.println(F(" completed."));
 
-	writeIntToEEPROM(calibrationServo * 4, totalSteps[calibrationServo]);
-	writeIntToEEPROM(calibrationServo * 4 + 2, 0);
+	// Serial.print(F("Rotations: "));
+	// Serial.print(totalRotations[calibrationServo]);
+	// Serial.print(F(" + "));
+	// Serial.print(totalSteps[calibrationServo]);
+	// Serial.println(F(" steps. Saving to EEPROM."));
+
+	writeIntToEEPROM(calibrationServo * 8 + 0, totalRotations[calibrationServo]);
+	writeIntToEEPROM(calibrationServo * 8 + 2, totalSteps[calibrationServo]);
+	writeIntToEEPROM(calibrationServo * 8 + 4, currentRotations[calibrationServo]);
+	writeIntToEEPROM(calibrationServo * 8 + 6, 0);
 
 	calibrationMode = CALIBRATION_NONE;
 	calibrationServo = -1;
+
+	digitalWrite(DEBUG2, LOW);
 }
 
 void outputDebugInfo()
 {
-	Serial.println(F("Timing values (up / down):"));
+	Serial.println(F("Timing values (rotations + steps):"));
 	for (int i = 0; i < 12; i++)
 	{
 		ContinuousServo *servo = servos[i];
 		Serial.print(F("  "));
 		Serial.print(i);
 		Serial.print(F(": "));
+		Serial.print(totalRotations[i]);
+		Serial.print(F(" + "));
 		Serial.print(totalSteps[i]);
 		Serial.print(F(" @ "));
+		Serial.print(currentRotations[i]);
+		Serial.print(F(" + "));
 		Serial.println(servo->getSteps());
 	}
 }
@@ -437,11 +511,15 @@ void updateServos()
 	{
 		if (totalSteps[i] > 0)
 		{
-			targetSteps[i] = (float)rainValues[i] / 255.0f * totalSteps[i];
+			float p = (float)rainValues[i] / 255.0f;
+			targetRotations[i] = p * totalRotations[i];
+			targetSteps[i] = p * totalSteps[i];
 			Serial.print(rainValues[i]);
 			Serial.print(F(" / 255.0f = "));
 			Serial.print((float)rainValues[i] / 255.0f);
-			Serial.print(F(", "));
+			Serial.print(F(" -> "));
+			Serial.print(totalRotations[i]);
+			Serial.print(F(" + "));
 			Serial.print(targetSteps[i]);
 			Serial.println(F(" steps"));
 		}
@@ -457,11 +535,16 @@ void updateNextServo()
 	{
 		// Previous servo completed
 		ContinuousServo *servo = servos[currentServoIndex];
-		writeIntToEEPROM(currentServoIndex * 4 + 2, servo->getSteps());
+		writeIntToEEPROM(calibrationServo * 8 + 4, currentRotations[calibrationServo]);
+		writeIntToEEPROM(calibrationServo * 8 + 6, servo->getSteps());
 	}
 	if (++currentServoIndex >= 12) return;
 	ContinuousServo *servo = servos[currentServoIndex];
-	if (targetSteps[currentServoIndex] != servo->getSteps())
+	if (currentRotations[currentServoIndex] != targetRotations[currentServoIndex])
+	{
+		servo->step(targetRotations[currentServoIndex] > currentRotations[currentServoIndex] ? 10000 : -10000);
+	}
+	else if (servo->getSteps() != targetSteps[currentServoIndex])
 	{
 		servo->stepTo(targetSteps[currentServoIndex], updateNextServo);
 	}
